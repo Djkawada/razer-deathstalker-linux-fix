@@ -26,9 +26,15 @@ package() {
 
     install -dm755 "${pkgdir}/etc/mkinitcpio.conf.d"
     cat << 'EOF' > "${pkgdir}/etc/mkinitcpio.conf.d/razer-deathstalker-fix.conf"
-# Early-load razer_deathstalker_fix when built for the target kernel
+# Early-load razer_deathstalker_fix first when built for the target kernel
 if [[ $(modinfo -k "${KERNELVERSION:-$(uname -r)}" -F filename razer_deathstalker_fix 2>/dev/null) == /* ]]; then
-  MODULES+=(razer_deathstalker_fix)
+  MODULES=(razer_deathstalker_fix "${MODULES[@]}")
 fi
+EOF
+
+    install -dm755 "${pkgdir}/etc/limine-entry-tool.d"
+    cat << 'EOF' > "${pkgdir}/etc/limine-entry-tool.d/razer-deathstalker-fix.conf"
+# Prevent built-in usbhid (=y) from probing 1532:011f before initramfs loads razer_deathstalker_fix
+KERNEL_CMDLINE[default]+=" usbhid.quirks=0x1532:0x011f:0x00000004"
 EOF
 }

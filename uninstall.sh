@@ -12,7 +12,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "==> Unloading ${KO_NAME} from running kernel..."
-if lsmod | grep -q "^${KO_NAME}\b"; then
+if [[ -d "/sys/module/${KO_NAME}" ]]; then
     rmmod "${KO_NAME}" || true
 fi
 
@@ -26,6 +26,13 @@ fi
 rm -rf "${SRC_DIR}"
 rm -f "/etc/modules-load.d/${MODULE_NAME}.conf"
 rm -f "/etc/mkinitcpio.conf.d/${MODULE_NAME}.conf"
+rm -f "/etc/limine-entry-tool.d/${MODULE_NAME}.conf"
+if [[ -f "/etc/default/grub.d/${MODULE_NAME}.cfg" ]]; then
+    rm -f "/etc/default/grub.d/${MODULE_NAME}.cfg"
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    fi
+fi
 
 echo "==> Updating initramfs..."
 if [[ -f /etc/mkinitcpio.conf ]]; then

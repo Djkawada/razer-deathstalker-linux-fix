@@ -1,0 +1,53 @@
+Subject / Summary:
+HID: usbhid: Razer DeathStalker Essential 2014 (1532:011f) 51.2s EP0 initialization timeout (-110), dead LEDs, and hotplug failure
+
+Product: Drivers
+Component: USB (or HID)
+Hardware: All
+Kernel Version: 6.x / 7.x
+
+Description:
+Overview
+========
+When booting with or hot-plugging a Razer DeathStalker Essential 2014 keyboard (USB ID 1532:011f), USB HID enumeration hangs for 51.2 seconds (`usbhid: can't add hid device: -110` on interfaces 1.1 and 1.2), status LEDs (NumLock / CapsLock / ScrollLock) fail to light (`usb_submit_urb(ctrl) failed: -1`), and unplugging/replugging leaves the keyboard completely unresponsive on ~75% of attempts.
+
+dmesg Output (Unpatched)
+========================
+usb 3-6.2: new full-speed USB device number 5 using xhci_hcd
+usb 3-6.2: New USB device found, idVendor=1532, idProduct=011f, bcdDevice= 2.00
+usb 3-6.2: Product: Razer DeathStalker Essential 2014
+usb 3-6.2: Manufacturer: Razer
+input: Razer Razer DeathStalker Essential 2014 as /devices/.../input/input5
+hid-generic 0003:1532:011F.0001: input,hidraw0: USB HID v1.11 Keyboard [Razer Razer DeathStalker Essential 2014] on usb-.../input0
+usbhid 3-6.2:1.0: usb_submit_urb(ctrl) failed: -1
+usbhid 3-6.2:1.1: can't add hid device: -110
+usbhid 3-6.2:1.1: probe with driver usbhid failed with error -110
+usbhid 3-6.2:1.2: can't add hid device: -110
+usbhid 3-6.2:1.2: probe with driver usbhid failed with error -110
+
+Root Cause Analysis (Verified via usbmon & EP0 probing)
+=======================================================
+The Razer DeathStalker Essential 2014 exposes 3 USB HID interfaces sharing Control Endpoint 0 (EP0, bMaxPacketSize0 = 64):
+- Interface 0 (1.0): Boot Keyboard + LEDs (61-byte report descriptor, ep_81 IN)
+- Interface 1 (1.1): NKRO Keyboard + Consumer/System Control (179-byte report descriptor, ep_82 IN)
+- Interface 2 (1.2): Virtual Mouse + 90-byte Vendor Feature Report (94-byte report descriptor, ep_83 IN)
+
+Three interacting firmware/kernel behaviors wedge the keyboard microcontroller's EP0 state machine on Linux:
+
+1. `usbhid_init_reports()` (`HID_REQ_GET_REPORT`) on Interface 0:
+   Sending `HID_REQ_GET_REPORT` (0x01) over EP0 during `usbhid_start()` destabilizes the MCU. Applying `HID_QUIRK_NO_INIT_REPORTS | HID_QUIRK_NOGET` prevents `usbhid_init_reports()` from probing reports on EP0.
+
+2. Dirty EP0 state after class `GET_DESCRIPTOR(HID_DT_REPORT)` (`bmRequestType = 0x81`):
+   After `usbhid_parse()` reads the 61-byte `HID_DT_REPORT` descriptor on Interface 0 (`bmRequestType = 0x81`), the MCU leaves its EP0 parser in a state where an immediate class-specific `HID_REQ_SET_REPORT` (`bmRequestType = 0x21`, bRequest = 0x09 — used to set the NumLock LED) or `HID_REQ_SET_IDLE` either fails or locks up EP0.
+   Issuing a standard 18-byte `GET_DESCRIPTOR(USB_DT_DEVICE)` (`bmRequestType = 0x80`, bRequest = 0x06, wValue = 0x0100) on EP0 immediately before and immediately after `usbhid_parse()` resets the MCU's EP0 state machine cleanly.
+
+3. Asynchronous `hdev->led_work` (`SET_REPORT`) race vs. Interface 1.1 enumeration:
+   At the end of Interface 0's input registration (`hidinput_connect()` -> `input_register_device()` -> `input_leds_connect()`), the kernel schedules `hdev->led_work` (`hidinput_led_worker`) asynchronously on `system_wq` to send `HID_REQ_SET_REPORT` over EP0 at the exact same moment `usb_set_configuration()` moves on to probe Interface 1 (1.1) on EP0.
+   Additionally, on Interface 1's first 179-byte (`0xb3`) `GET_DESCRIPTOR(HID_DT_REPORT)` request, the MCU occasionally drops one 64-byte packet and returns 115 bytes (`179 - 64`). When `usbhid_parse()` immediately retries without an intervening `USB_DT_DEVICE` descriptor read, EP0 stops responding for 2 x 25.6s = 51.2s (`-ETIMEDOUT`).
+
+Verified Fix / Proof of Concept
+===============================
+Flushing `hdev->led_work` before probing secondary interfaces, applying `HID_QUIRK_NO_INIT_REPORTS | HID_QUIRK_NOGET`, and issuing an 18-byte `GET_DESCRIPTOR(USB_DT_DEVICE)` on EP0 between HID descriptor reads reduces initialization time from 51.2s to < 0.2s, makes hotplugging 100% reliable, and restores NumLock/CapsLock LEDs across all 3 interfaces (`1.0`, `1.1`, `1.2`).
+
+Full working out-of-tree DKMS module demonstrating the fix:
+https://github.com/Djkawada/razer-deathstalker-linux-fix

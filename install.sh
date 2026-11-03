@@ -37,15 +37,32 @@ echo "==> Configuring automatic load at boot (/etc/modules-load.d/${MODULE_NAME}
 mkdir -p /etc/modules-load.d
 echo "${KO_NAME}" > "/etc/modules-load.d/${MODULE_NAME}.conf"
 
+echo "==> Configuring kernel command line quirk (usbhid.quirks=0x1532:0x011f:0x00000004)..."
+if [[ -d /etc/limine-entry-tool.d ]] || command -v limine-mkinitcpio >/dev/null 2>&1; then
+    mkdir -p /etc/limine-entry-tool.d
+    cat << 'EOF' > "/etc/limine-entry-tool.d/${MODULE_NAME}.conf"
+# Prevent built-in usbhid (=y) from probing 1532:011f before initramfs loads razer_deathstalker_fix
+KERNEL_CMDLINE[default]+=" usbhid.quirks=0x1532:0x011f:0x00000004"
+EOF
+fi
+if [[ -d /etc/default/grub.d ]]; then
+    cat << 'EOF' > "/etc/default/grub.d/${MODULE_NAME}.cfg"
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT} usbhid.quirks=0x1532:0x011f:0x00000004"
+EOF
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    fi
+fi
+
 echo "==> Configuring early-boot initramfs..."
 if [[ -d /etc/mkinitcpio.conf.d ]]; then
     if [[ -f /etc/mkinitcpio.conf.bak ]]; then
         mv -f /etc/mkinitcpio.conf.bak /etc/mkinitcpio.conf
     fi
     cat << 'EOF' > "/etc/mkinitcpio.conf.d/${MODULE_NAME}.conf"
-# Early-load razer_deathstalker_fix when built for the target kernel
+# Early-load razer_deathstalker_fix first when built for the target kernel
 if [[ $(modinfo -k "${KERNELVERSION:-$(uname -r)}" -F filename razer_deathstalker_fix 2>/dev/null) == /* ]]; then
-  MODULES+=(razer_deathstalker_fix)
+  MODULES=(razer_deathstalker_fix "${MODULES[@]}")
 fi
 EOF
 elif [[ -f /etc/mkinitcpio.conf ]]; then
@@ -71,7 +88,7 @@ elif command -v update-initramfs >/dev/null 2>&1; then
 fi
 
 echo "==> Loading ${KO_NAME} into the running kernel..."
-if lsmod | grep -q "^${KO_NAME}\b"; then
+if [[ -d "/sys/module/${KO_NAME}" ]]; then
     rmmod "${KO_NAME}" || true
 fi
 modprobe "${KO_NAME}"

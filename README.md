@@ -55,18 +55,24 @@ When Interface `0` (`1.0`) finishes registering its input device (`hidinput_conn
 - At that **exact same microsecond**, `usb_set_configuration()` moves on to probe Interface `1` (`1.1`) on `EP0`.
 - Furthermore, on Interface `1`'s first `179`-byte (`0xb3`) `GET_DESCRIPTOR(HID_DT_REPORT)` request, the MCU occasionally drops one 64-byte packet and returns `115` bytes (`179 - 64`). When `usbhid_parse()` immediately retries without resetting `EP0`, the MCU stops responding on `EP0` entirely, causing `1.1` and `1.2` to time out for `25.6s + 25.6s = 51.2s` (`-110`).
 
+### 4. Competing LED Output Reports & Built-in `CONFIG_USB_HID=y` Pre-Initramfs Probe
+- **Competing LED Output Reports:** Both Interface `1.0` (61 bytes) and Interface `1.1` (179 bytes) declare LED Output blocks. Because Interface `1.1` is the active NKRO keyboard where all user keystrokes originate in Linux, Wayland/Hyprland sends LED updates strictly to Interface `1.1`. If both declare LEDs, Linux sends simultaneous `HID_REQ_SET_REPORT` control transfers to both `wIndex = 0` and `wIndex = 1` on `EP0`, wedging the MCU (`-110`). By masking the unused LED descriptor on Interface `1.0`, Interface `1.1` exclusively and reliably drives the physical LEDs.
+- **Pre-Initramfs Built-in `usbhid` Probe:** On kernels with `CONFIG_USB_HID=y` built into `vmlinuz`, USB enumeration and `usbhid` probing occur ~1.4s into boot inside `wait_for_device_probe()`, **before** initramfs `/init` runs (~52.9s later after `1.1` and `1.2` time out).
+
 ---
 
 ## How This Module Fixes It
 
-`razer_deathstalker_fix` is a lightweight, zero-overhead Linux kernel module that registers bus notifiers on `usb_bus_type` and `hid_bus_type` matching **only** `1532:011f`:
+`razer_deathstalker_fix` is a lightweight, zero-overhead Linux kernel module that registers bus notifiers on `usb_bus_type` and `hid_bus_type` matching **only** `1532:011f`, plus a cold-boot handoff:
 
-1. **Before `1.0` `usbhid_parse()` (`usb_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
+1. **Cold-Boot Pre-Initramfs Protection (`usbhid.quirks=0x1532:0x011f:0x00000004`):**
+   Passing `HID_QUIRK_IGNORE` (`0x04`) on the kernel command line tells built-in `usbhid` to skip `1532:011f` during the pre-initramfs kernel boot phase with zero `EP0` traffic. When `razer_deathstalker_fix` loads at the start of initramfs, it calls `hid_quirks_exit(BUS_USB)` to clear the ignore quirk and immediately adopts all `1532:011f` interfaces (`1.0`, `1.1`, `1.2`) with full `EP0` synchronization.
+2. **Before `1.0` `usbhid_parse()` (`usb_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
    Sends an 18-byte `GET_DESCRIPTOR(USB_DT_DEVICE)` on `EP0` to ensure a clean `EP0` state after `SET_CONFIGURATION(1)`.
-2. **After `1.0` `usbhid_parse()` & Before `usbhid_start()` (`hid_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
-   Applies `HID_QUIRK_NO_INIT_REPORTS | HID_QUIRK_NOGET` (`0x20000008`) to `hdev->quirks` and sends an 18-byte `GET_DESCRIPTOR(USB_DT_DEVICE)` on `EP0` so the subsequent NumLock LED `SET_REPORT` succeeds every time.
-3. **Before `1.1` and `1.2` Probe (`usb_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
-   Calls `flush_work(&last_hdev->led_work)` so `1.0`'s asynchronous LED `SET_REPORT` completes before `1.1` touches `EP0`, primes `1.1`'s `179`-byte report descriptor, and resets `EP0` with `GET_DESCRIPTOR(USB_DT_DEVICE)` before `usbhid_parse()` runs on `1.1` and `1.2`.
+3. **After `1.0` `usbhid_parse()` & Before `usbhid_start()` (`hid_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
+   Applies `HID_QUIRK_NO_INIT_REPORTS | HID_QUIRK_NOGET` (`0x20000008`) to `hdev->quirks`, masks the unused LED Output descriptor on Interface `1.0` (`dev_rdesc[0x37] = 0x01` `Const`), and sends an 18-byte `GET_DESCRIPTOR(USB_DT_DEVICE)` on `EP0`. Masking Interface `1.0`'s LEDs ensures that Interface `1.1` (the primary NKRO keyboard generating keystrokes) owns the LEDs so Wayland/Hyprland modifiers toggle hardware LEDs in real-time without competing `SET_REPORT` control transfers on EP0.
+4. **Before `1.1` and `1.2` Probe (`usb_bus_type` `BUS_NOTIFY_ADD_DEVICE`):**
+   Primes `1.1`'s `179`-byte report descriptor, flushes any in-flight LED work, and resets `EP0` with `GET_DESCRIPTOR(USB_DT_DEVICE)` before `usbhid_parse()` runs on `1.1` and `1.2`.
 
 ### Kernel Log With Fix Installed
 
